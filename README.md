@@ -1,6 +1,9 @@
 # gmail-receipt-download-bookkeeping
 Autodownload receipts from Gmail, save them to Drive, and forward them to your bookkeeper, QuickBooks, or a receipt management tool.
 
+This is a basic script, but it includes instructions to customize it 
+to download & forward receipts using more complex logic than the examples.
+
 # Gmail Receipt Saver (Google Apps Script)
 
 One Google Apps Script project that finds receipts/invoices in Gmail, saves
