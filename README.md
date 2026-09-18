@@ -21,84 +21,92 @@ and can read/control your own Gmail, Drive, etc. Manage projects at
 [script.google.com](https://script.google.com). A project holds one or
 more `.gs` code files plus one `appsscript.json` manifest (permissions).
 
-## What it does
+Automated Gmail Receipt Forwarder for QuickBooks & Google Drive
 
-Runs daily via `runAllReceiptRules()`:
-1. Creates (once) or reuses the "Receipts - App Scripts" Drive folder.
-2. Runs each rule in the `RULES` array against Gmail — ships with an
-   Anthropic-invoice rule and a generic-receipt rule.
-3. If `RECIPIENT_EMAIL` is set, emails any PDF added to the folder since
-   the last run.
+An automated Google Apps Script solution that monitors your Gmail inbox for incoming receipts, saves the documents to a designated Google Drive folder, and forwards them directly to QuickBooks Online for expense matching—without requiring elevated Gmail write permissions or custom labels.
+Key Features
 
-Everything remembers what it's already handled (via `PropertiesService`),
-so nothing is ever processed or emailed twice.
+    Strictly Read-Only Security (gmail.readonly): Requires no label management or gmail.modify permissions.
 
-## Setup
+    Zero Duplication Loop: Filters out outgoing messages (-from:me) to prevent self-forwarding loops and tracks processed message IDs in PropertiesService.
 
-1. Go to [script.google.com](https://script.google.com) → **New project**.
-2. Paste in `Code.gs`. Edit the CONFIGURATION block: set `RECIPIENT_EMAIL`
-   (leave `''` to skip emailing).
-3. Project Settings → check **"Show `appsscript.json` manifest file"** →
-   paste this repo's `appsscript.json` scopes into it.
-4. Save. Run `createDailyTrigger` once. Authorize when prompted (click
-   **Advanced → Go to [project] (unsafe) → Allow** — expected for your own
-   script).
-5. Check **View → Executions** for the printed Drive folder ID/log output.
+    Smart PDF Generation: Automatically converts email body receipts into clean, OCR-friendly PDFs complete with a metadata header containing the exact sender, recipient, explicit time zone timestamp, standard RFC 822 Message-ID, and Gmail Internal ID.
 
-Run `runAllReceiptRules` manually any time to test instead of waiting for
-the trigger.
+    QuickBooks OCR Compatible: Sanitizes file names to strictly alphanumeric characters to prevent QuickBooks "Invalid document" import errors.
 
-## How it works
+    Daily Automation: Integrated trigger setup to run automatically every day.
 
-- **`RULES`** — each object: `subjectStartsWith`/`subjectContains`,
-  `excludeSubjectStartsWith`, `attachmentPdfNameContains`, and
-  `whenAttachmentFound`/`whenAttachmentNotFound` (`'save'`,
-  `'saveEmailAsPdf'`, or `'skip'`). Add new email patterns by adding new
-  rule objects — no other code changes needed.
-- **`processRule`** — searches Gmail per rule, skips already-processed
-  message IDs (stored per-rule so rules never collide), saves matching
-  attachments or converts the email to PDF.
-- **`getOrCreateFolder`** — creates the shared folder once and remembers
-  its ID.
-- **`emailNewReceipts`** — after the rules run, emails any PDF in the
-  folder created since its own last-run timestamp.
+Prerequisites & Required OAuth Scopes
 
-## Permissions
+This script requires the following Google OAuth scopes defined in your project's appsscript.json:
+JSON
 
-| Scope | Why |
-|---|---|
-| `gmail.readonly` | Search/read email and attachments only — can't send, delete, or modify mail. |
-| `drive` | Needed for `DriveApp.createFolder` (Apps Script requires this even for a folder the script owns — `drive.file` isn't sufficient for folder creation). |
-| `script.scriptapp` | Lets the script schedule its own daily run. |
-| `script.send_mail` | Only allows sending email as you — no inbox/contacts access. |
+{
+  "timeZone": "America/New_York",
+  "dependencies": {},
+  "exceptionLogging": "STACKDRIVER",
+  "runtimeVersion": "V8",
+  "oauthScopes": [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/script.send_mail",
+    "https://www.googleapis.com/auth/script.scriptapp"
+  ]
+}
 
-This is the minimum needed for one project to create the folder, read
-Gmail, and send email — no separate Drive-wide read scope is needed since
-the script already owns the folder from the `drive` scope above.
+Configuration
 
-## Troubleshooting
+Customize the global constants at the top of Code.gs to match your workflow:
+Variable	Description	Default / Example
+SUBJECT_KEYWORDS	Array of subject strings to match incoming receipt emails.	['receipt', 'payment processed', 'your invoice is available']
+EXCLUDE_SUBJECT_KEYWORDS	Subject strings to skip (e.g., refunds, notifications).	[]
+EXCLUDE_SENDERS	Email addresses or domains to ignore.	[]
+DRIVE_FOLDER_NAME	Name of the target Google Drive folder.	'Receipts - App Scripts'
+RECIPIENT_EMAIL	Your QuickBooks Online custom expense forwarding email address.	'yourcompany+expenses@______.com'
+EMAIL_SUBJECT_PREFIX	Prefix added to outgoing forwarded emails.	'New receipt: '
+Setup & Installation
 
-- **"Not sufficient permissions"** — scope in `appsscript.json` doesn't
-  match; re-check step 3, then re-run and re-authorize.
-- **Duplicate `const` / syntax errors** — another file in the project
-  still has old code; delete extra `.gs` files, keep only one.
-- **Re-process an email** — delete its ID from Script Properties
-  (Project Settings → Script Properties).
+    Create Apps Script Project:
 
-## Going further
+        Open Google Apps Script and create a new project.
 
-Extend a rule's matching logic directly in `processRule`/
-`subjectMatchesRule`:
+        Enable the manifest view in Project Settings > Show "appsscript.json" manifest file in editor.
 
-```js
-// exclude a sender domain
-if (message.getFrom().includes('@example.com')) return;
+    Paste Code:
 
-// require two phrases in the body
-const body = message.getPlainBody().toLowerCase();
-if (!(body.includes('your receipt') && body.includes('amount paid'))) return;
-```
+        Replace appsscript.json with the manifest configuration provided above.
 
+        Replace Code.gs with the project code and update RECIPIENT_EMAIL to your QuickBooks forwarding address.
+
+    Baseline Run & Authorization:
+
+        Run runAllReceiptRules() manually once from the toolbar.
+
+        Grant the required permissions when prompted.
+
+        This initial run sets the baseline timestamp (LAST_RUN_TIMESTAMP) to look back exactly 24 hours.
+
+    Enable Daily Automation:
+
+        Select createDailyTrigger from the function dropdown in the Apps Script editor.
+
+        Click Run to schedule the script automatically every morning between 6:00 AM and 7:00 AM.
+
+How Duplicate Prevention Works
+
+[ Gmail Inbox ] 
+      │
+      ├── 1. Query: in:inbox -from:me newer_than:2d subject:(...)
+      │
+      ├── 2. Check: Was Message ID processed in PROCESSED_MESSAGE_IDS array? ──► Yes ──► Skip
+      │                                 │
+      │                                No
+      │                                 ▼
+      └── 3. Check: Received Date <= LAST_RUN_TIMESTAMP? ─────────────► Yes ──► Skip
+                                        │
+                                       No
+                                        ▼
+                   [ Save PDF to Drive & Forward to QuickBooks ]
 --
 
 ## Disclaimer
