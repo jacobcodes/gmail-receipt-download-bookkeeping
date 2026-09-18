@@ -1,229 +1,203 @@
-/**
- * ============================================================
- *  SCRIPT 1: Receipt Download Rules (rule engine)
- * ============================================================
- *  What this does, in plain English:
- *  Once a day, this script goes through a list of "rules" you
- *  define in the RULES array below. Each rule describes one kind
- *  of email to look for in Gmail, and what to save to Drive when
- *  it's found. Two rules are included to start:
- *
- *    1. anthropic-invoice — finds emails starting with "Your
- *       receipt from Anthropic" that have a PDF attachment named
- *       with "invoice", and saves that attachment.
- *    2. generic-receipt — finds emails with "receipt" in the
- *       subject (skipping the Anthropic ones above) that do NOT
- *       already have a PDF attachment named with "receipt", and
- *       saves the whole email as a PDF instead.
- *
- *  To add a new rule later (e.g. for a different client or a new
- *  vendor), you only need to add a new entry to the RULES array —
- *  no other code needs to change. See the README's "Going
- *  further" section for more field options.
- *
- *  All rules share one Drive folder and one "memory" of which
- *  emails have already been handled, so nothing is ever saved
- *  twice.
- * ============================================================
- */
-
-// ----------------------------------------------------------------
-// CONFIGURATION
-// ----------------------------------------------------------------
-
-// The Drive folder all rules save into. The script creates this
-// folder itself the first time it runs (see getOrCreateFolder
-// below) — you don't need to create it by hand.
-const DRIVE_FOLDER_NAME = 'Receipts - App Scripts';
-
-const SEARCH_WINDOW_DAYS = 30;
-const MAX_REMEMBERED_IDS = 2000;
-
-// Email new PDFs here as they're saved. Leave blank ('') to disable.
-const RECIPIENT_EMAIL = 'PASTE_RECIPIENT_EMAIL_HERE';
-const EMAIL_SUBJECT_PREFIX = 'New receipt: ';
-
-const RULES = [
-  {
-    id: 'anthropic-invoice',
-    subjectStartsWith: 'Your receipt from Anthropic',
-    attachmentPdfNameContains: 'invoice',
-    whenAttachmentFound: 'save',      // save the matching attachment
-    whenAttachmentNotFound: 'skip',   // do nothing
-  },
-  {
-    id: 'generic-receipt',
-    subjectContains: 'receipt',
-    excludeSubjectStartsWith: ['Your receipt from Anthropic'],
-    attachmentPdfNameContains: 'receipt',
-    whenAttachmentFound: 'skip',            // leave it alone
-    whenAttachmentNotFound: 'saveEmailAsPdf', // convert the email to a PDF
-  },
-  // Add more rules here — copy one of the objects above as a
-  // starting point.
+// ---------------- WHAT TO MATCH ----------------
+const SUBJECT_KEYWORDS = [
+  'receipt',
+  'payment processed',
+  'your invoice is available'
 ];
 
-// ----------------------------------------------------------------
-// MAIN FUNCTION — runs every rule, once a day
-// ----------------------------------------------------------------
+const EXCLUDE_SUBJECT_KEYWORDS = [
+  // 'EXCLUDETHISSUBJECT'
+];
+
+const EXCLUDE_SENDERS = [
+  // 'spam@example.com'
+];
+
+const ATTACHMENT_PDF_NAME_CONTAINS = '.pdf';
+
+// ---------------- OTHER SETTINGS ----------------
+const DRIVE_FOLDER_NAME = 'Receipts - App Scripts';
+const RECIPIENT_EMAIL = 'ADDTHEEMAILADDRESSYOUWANTTOSENDRECEIPTSTOHERE';
+const EMAIL_SUBJECT_PREFIX = 'New receipt: ';
+const MAX_ID_HISTORY = 200; 
+
+// ---------------- MAIN ----------------
 function runAllReceiptRules() {
-  const folder = getOrCreateFolder();
-  RULES.forEach(rule => processRule(rule, folder));
-  if (RECIPIENT_EMAIL) emailNewReceipts(folder);
-}
-
-// ----------------------------------------------------------------
-// EMAILER — emails any PDF added to the folder since the last run
-// ----------------------------------------------------------------
-function emailNewReceipts(folder) {
   const props = PropertiesService.getScriptProperties();
-  const lastRunIso = props.getProperty('LAST_EMAIL_RUN');
-  const lastRunDate = lastRunIso ? new Date(lastRunIso) : new Date(0);
-  const runStartedAt = new Date();
-
-  const files = folder.getFilesByType(MimeType.PDF);
-  while (files.hasNext()) {
-    const file = files.next();
-    if (file.getDateCreated() > lastRunDate) {
-      MailApp.sendEmail({
-        to: RECIPIENT_EMAIL,
-        subject: EMAIL_SUBJECT_PREFIX + file.getName(),
-        body: `A new receipt PDF, "${file.getName()}", was added to your Drive folder. It is attached to this email.`,
-        attachments: [file.getAs(MimeType.PDF)],
-      });
-    }
+  const lastRunIso = props.getProperty('LAST_RUN_TIMESTAMP');
+  
+  const now = new Date();
+  const lastRunDate = lastRunIso ? new Date(lastRunIso) : new Date(now.getTime() - (24 * 60 * 60 * 1000));
+  
+  let processedIds = [];
+  try {
+    processedIds = JSON.parse(props.getProperty('PROCESSED_MESSAGE_IDS') || '[]');
+  } catch (e) {
+    processedIds = [];
   }
-  props.setProperty('LAST_EMAIL_RUN', runStartedAt.toISOString());
-}
 
-// ----------------------------------------------------------------
-// RULE ENGINE — the same logic runs for every rule in RULES
-// ----------------------------------------------------------------
-function processRule(rule, folder) {
-  const processedIds = getProcessedIds(rule.id);
-  const query = buildQuery(rule);
-  const threads = GmailApp.search(query);
+  const folder = getOrCreateFolder();
+  const threads = GmailApp.search(buildQuery());
   let count = 0;
 
-  threads.forEach(thread => {
-    thread.getMessages().forEach(message => {
-      const messageId = message.getId();
-      if (processedIds.has(messageId)) return;
+  try {
+    threads.forEach(thread => {
+      thread.getMessages().forEach(message => {
+        const msgId = message.getId();
+        const msgDate = message.getDate();
 
-      const subject = message.getSubject();
-      if (!subjectMatchesRule(subject, rule)) {
-        processedIds.add(messageId);
-        return;
-      }
+        if (processedIds.includes(msgId)) return;
+        if (msgDate <= lastRunDate) return;
+        if (!subjectAndSenderMatch(message)) return;
 
-      const matchingAttachment = message.getAttachments().find(att =>
-        att.getContentType() === 'application/pdf' &&
-        att.getName().toLowerCase().includes(rule.attachmentPdfNameContains.toLowerCase())
-      );
+        const pdfBlob = getReceiptPdf(message);
+        folder.createFile(pdfBlob);
 
-      if (matchingAttachment) {
-        if (rule.whenAttachmentFound === 'save') {
-          folder.createFile(matchingAttachment.copyBlob());
-          count++;
+        if (RECIPIENT_EMAIL) {
+          MailApp.sendEmail({
+            to: RECIPIENT_EMAIL,
+            subject: EMAIL_SUBJECT_PREFIX + pdfBlob.getName(),
+            body: `Receipt "${pdfBlob.getName()}" is attached.`,
+            attachments: [pdfBlob]
+          });
         }
-      } else if (rule.whenAttachmentNotFound === 'saveEmailAsPdf') {
-        saveEmailAsPdf(message, folder);
+
+        processedIds.push(msgId);
         count++;
-      }
-
-      processedIds.add(messageId);
+      });
     });
-  });
+  } finally {
+    if (processedIds.length > MAX_ID_HISTORY) {
+      processedIds = processedIds.slice(-MAX_ID_HISTORY);
+    }
+    props.setProperty('PROCESSED_MESSAGE_IDS', JSON.stringify(processedIds));
+    props.setProperty('LAST_RUN_TIMESTAMP', now.toISOString());
+  }
 
-  saveProcessedIds(rule.id, processedIds);
-  console.log(`[${rule.id}] Saved ${count} new file(s).`);
+  console.log(`Processed ${count} new receipt(s).`);
 }
 
-// Builds a Gmail search query from a rule's subject fields.
-function buildQuery(rule) {
-  const parts = [`newer_than:${SEARCH_WINDOW_DAYS}d`];
-  if (rule.subjectStartsWith) parts.push(`subject:"${rule.subjectStartsWith}"`);
-  if (rule.subjectContains) parts.push(`subject:${rule.subjectContains}`);
-  (rule.excludeSubjectStartsWith || []).forEach(text => parts.push(`-subject:"${text}"`));
-  return parts.join(' ');
+function buildQuery() {
+  const subjectPart = `subject:(${SUBJECT_KEYWORDS.map(k => `"${k}"`).join(' OR ')})`;
+  return `in:inbox -from:me newer_than:2d ${subjectPart}`;
 }
 
-// Gmail's search is a loose match, so this double-checks the
-// subject really satisfies the rule before acting on it.
-function subjectMatchesRule(subject, rule) {
-  if (rule.subjectStartsWith && !subject.startsWith(rule.subjectStartsWith)) return false;
-  if (rule.subjectContains && !subject.toLowerCase().includes(rule.subjectContains.toLowerCase())) return false;
-  if ((rule.excludeSubjectStartsWith || []).some(text => subject.startsWith(text))) return false;
+function subjectAndSenderMatch(message) {
+  const subject = message.getSubject().toLowerCase();
+  const from = message.getFrom().toLowerCase();
+
+  if (!SUBJECT_KEYWORDS.some(k => subject.includes(k.toLowerCase()))) return false;
+  if (EXCLUDE_SUBJECT_KEYWORDS.some(s => subject.includes(s.toLowerCase()))) return false;
+  if (EXCLUDE_SENDERS.some(s => from.includes(s.toLowerCase()))) return false;
   return true;
 }
 
-// ----------------------------------------------------------------
-// HELPER FUNCTIONS
-// ----------------------------------------------------------------
+function getReceiptPdf(message) {
+  const attachment = message.getAttachments().find(att =>
+    att.getContentType() === 'application/pdf' &&
+    att.getName().toLowerCase().includes(ATTACHMENT_PDF_NAME_CONTAINS.toLowerCase())
+  );
+  
+  if (attachment) {
+    const rawName = attachment.getName().replace(/\.pdf$/i, '');
+    const cleanName = `${sanitizeFilename(rawName)}.pdf`;
+    const blob = attachment.copyBlob();
+    blob.setName(cleanName);
+    return blob;
+  }
 
-// Finds (or creates, the first time ever) the shared Drive folder,
-// and remembers its ID so future runs reuse the same folder.
+  const timeZone = Session.getScriptTimeZone();
+  const dateStr = Utilities.formatDate(message.getDate(), timeZone, 'yyyyMMdd_HHmmss');
+  // Includes time zone name and offset (e.g., "Sep 18, 2026, 3:56:00 PM EDT (UTC-04:00)")
+  const formattedDate = Utilities.formatDate(message.getDate(), timeZone, "MMM d, yyyy, h:mm:ss a z ('UTC'Z)");
+  
+  const rfcMessageId = getRfcMessageId(message);
+  const internalId = message.getId();
+
+  const cleanSubject = sanitizeFilename(message.getSubject() || 'Receipt');
+  const fileName = `${cleanSubject}_${dateStr}.pdf`;
+
+  const htmlHeader = `
+    <div style="font-family: Arial, sans-serif; font-size: 11px; color: #222; margin-bottom: 15px; border-bottom: 2px solid #ccc; padding-bottom: 12px;">
+      <p style="font-size: 10px; color: #555; font-style: italic; margin: 0 0 10px 0;">
+        [This email was saved as a PDF and automatically forwarded.]
+      </p>
+      <table style="width: 100%; border-collapse: collapse; font-size: 11px; line-height: 1.5; color: #333;">
+        <tr><td style="width: 120px; font-weight: bold; vertical-align: top;">From:</td><td>${escapeHtml(message.getFrom())}</td></tr>
+        <tr><td style="font-weight: bold; vertical-align: top;">To:</td><td>${escapeHtml(message.getTo())}</td></tr>
+        <tr><td style="font-weight: bold; vertical-align: top;">Date:</td><td>${formattedDate}</td></tr>
+        <tr><td style="font-weight: bold; vertical-align: top;">Subject:</td><td>${escapeHtml(message.getSubject())}</td></tr>
+        <tr><td style="font-weight: bold; vertical-align: top;">Message-ID (Header):</td><td>${escapeHtml(rfcMessageId)}</td></tr>
+        <tr><td style="font-weight: bold; vertical-align: top;">Gmail Internal ID:</td><td>${escapeHtml(internalId)}</td></tr>
+      </table>
+    </div>
+  `;
+
+  const fullHtml = `<!DOCTYPE html>
+  <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        @page { size: letter; margin: 0.5in; }
+        body { font-family: Arial, sans-serif; font-size: 12px; color: #222; margin: 0; padding: 0; }
+        div.email-body { margin-top: 15px; word-wrap: break-word; }
+      </style>
+    </head>
+    <body>
+      ${htmlHeader}
+      <div class="email-body">${message.getBody()}</div>
+    </body>
+  </html>`;
+
+  const blob = Utilities.newBlob(fullHtml, 'text/html', fileName).getAs('application/pdf');
+  blob.setName(fileName);
+  return blob;
+}
+
+function getRfcMessageId(message) {
+  try {
+    const raw = message.getRawContent();
+    const match = raw.match(/^Message-ID:\s*(<[^>]+>)/mi);
+    return match ? match[1] : message.getId();
+  } catch (e) {
+    return message.getId();
+  }
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function sanitizeFilename(name) {
+  if (!name) return 'Receipt';
+  return name
+    .replace(/[^a-zA-Z0-9]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 40) || 'Receipt';
+}
+
 function getOrCreateFolder() {
   const props = PropertiesService.getScriptProperties();
   const storedId = props.getProperty('FOLDER_ID');
   if (storedId) {
-    try {
-      return DriveApp.getFolderById(storedId);
-    } catch (e) {
-      // Stored ID is no longer valid (e.g. folder was deleted) — recreate below.
-    }
+    try { return DriveApp.getFolderById(storedId); } catch (e) {}
   }
   const folder = DriveApp.createFolder(DRIVE_FOLDER_NAME);
   props.setProperty('FOLDER_ID', folder.getId());
-  console.log(`Created folder "${DRIVE_FOLDER_NAME}" — ID: ${folder.getId()}`);
-  console.log('Copy this ID into the New Receipt Emailer script (Script 2) if you use it.');
   return folder;
 }
 
-// Turns an email's contents into a PDF file and drops it in the
-// given folder, for rules whose whenAttachmentNotFound is
-// 'saveEmailAsPdf'.
-function saveEmailAsPdf(message, folder) {
-  const fileName = sanitizeFilename(message.getSubject()) || 'receipt-email';
-  const htmlBody = message.getBody();
-  const pdfBlob = Utilities.newBlob(htmlBody, 'text/html', fileName).getAs('application/pdf');
-  pdfBlob.setName(fileName + '.pdf');
-  folder.createFile(pdfBlob);
-}
-
-// Removes characters that aren't safe to use in a file name.
-function sanitizeFilename(name) {
-  return name.replace(/[\\/:*?"<>|]/g, '').trim().slice(0, 120);
-}
-
-// Each rule gets its own "memory" of processed message IDs, keyed
-// by the rule's id, so rules never interfere with each other.
-function getProcessedIds(ruleId) {
-  const stored = PropertiesService.getScriptProperties().getProperty(`PROCESSED_IDS_${ruleId}`);
-  return new Set(stored ? JSON.parse(stored) : []);
-}
-
-function saveProcessedIds(ruleId, idsSet) {
-  const idsArray = Array.from(idsSet).slice(-MAX_REMEMBERED_IDS);
-  PropertiesService.getScriptProperties().setProperty(`PROCESSED_IDS_${ruleId}`, JSON.stringify(idsArray));
-}
-
-// ----------------------------------------------------------------
-// ONE-TIME SETUP — run this once to schedule the script to run
-// automatically every day. You do NOT need to run this more than once.
-// ----------------------------------------------------------------
 function createDailyTrigger() {
-  ScriptApp.getProjectTriggers().forEach(trigger => {
-    if (trigger.getHandlerFunction() === 'runAllReceiptRules') {
-      ScriptApp.deleteTrigger(trigger);
-    }
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'runAllReceiptRules') ScriptApp.deleteTrigger(t);
   });
-
-  ScriptApp.newTrigger('runAllReceiptRules')
-    .timeBased()
-    .everyDays(1)
-    .atHour(6)
-    .create();
-
+  ScriptApp.newTrigger('runAllReceiptRules').timeBased().everyDays(1).atHour(6).create();
   console.log('Daily trigger created.');
 }
